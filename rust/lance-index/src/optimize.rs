@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use crate::progress::{IndexBuildProgress, noop_progress};
 
 /// Options for optimizing all indices.
@@ -77,6 +79,23 @@ pub struct OptimizeOptions {
     /// most this many rows; `None` merges everything into one segment. See
     /// `max_rows_per_task` for what setting it changes.
     pub max_rows_per_segment: Option<u64>,
+
+    /// Consolidate the newest vector segments within this physical-row budget
+    /// per logical index. At least two complete segments must fit; older segments
+    /// and unindexed fragments are left untouched. Default: disabled.
+    ///
+    /// Compatible segments merge directly. Otherwise only the selected coverage
+    /// is re-encoded using the newest selected segment's full model, without
+    /// training. Each segment is charged the greater of its physical index
+    /// entries and its current covered fragments' physical rows, including
+    /// deleted rows. This bounds both direct merges and raw-vector scans.
+    /// Cannot be combined with retraining, partition rebalancing, an explicit
+    /// merge count, or `max_rows_per_segment`. `max_rows_per_task` may bound the
+    /// re-encoding tasks, but fragments are indivisible and must fit that bound.
+    pub max_rows_to_consolidate: Option<u64>,
+    /// Consolidate these segments of one vector index instead of a bounded
+    /// suffix; set with [`Self::consolidate_selected`]. Default: unset.
+    pub segments_to_consolidate: Option<Vec<Uuid>>,
 }
 
 impl Default for OptimizeOptions {
@@ -90,6 +109,8 @@ impl Default for OptimizeOptions {
             progress: noop_progress(),
             max_rows_per_task: None,
             max_rows_per_segment: None,
+            max_rows_to_consolidate: None,
+            segments_to_consolidate: None,
         }
     }
 }
@@ -111,6 +132,34 @@ impl OptimizeOptions {
         Self {
             num_indices_to_merge: Some(0),
             index_names: None,
+            ..Default::default()
+        }
+    }
+
+    /// Consolidate a bounded suffix of each vector index without training.
+    ///
+    /// Unindexed rows remain available to ordinary queries and can be indexed
+    /// separately with [`Self::append`]. A budget of zero is invalid.
+    pub fn consolidate(max_rows: u64) -> Self {
+        Self {
+            max_rows_to_consolidate: Some(max_rows),
+            ..Default::default()
+        }
+    }
+
+    /// Consolidate the named segments of one vector index, wherever they sit.
+    ///
+    /// Their rows are re-encoded, dropping deleted ones. Segments that share
+    /// one model keep it; otherwise a new model is trained on the selected
+    /// rows, since encoding data under a model trained on other data loses
+    /// recall. Output is one segment, or segments of at most
+    /// [`Self::max_rows_per_segment`] live rows; a fragment larger than that is
+    /// an output of its own. The selection is not bounded by a row budget, and
+    /// segments the index no longer has are skipped.
+    pub fn consolidate_selected(index_name: impl Into<String>, segments: Vec<Uuid>) -> Self {
+        Self {
+            index_names: Some(vec![index_name.into()]),
+            segments_to_consolidate: Some(segments),
             ..Default::default()
         }
     }

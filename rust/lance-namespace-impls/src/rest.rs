@@ -63,7 +63,7 @@ use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
-use lance_namespace::error::NamespaceError;
+use lance_namespace::error::{ErrorCode, NamespaceError};
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
@@ -579,6 +579,19 @@ fn parse_error(e: serde_json::Error) -> Error {
     .into()
 }
 
+/// Parses the `Retry-After` response header into a duration.
+///
+/// Only the delay-seconds form defined by RFC 9110 is supported. The
+/// HTTP-date form is ignored, since callers cannot act on an absolute
+/// timestamp without trusting the server's clock.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
 /// Parses a JSON response. Every object response is a model with a context
 /// field, which we fill from the response headers.
 fn parse_response<R: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Result<R> {
@@ -682,12 +695,26 @@ impl RestNamespace {
     /// Deserializes the response as an `ErrorResponse` model (the spec-defined
     /// flat JSON format with a required numeric `code` field). The error code is
     /// the sole source of truth for error classification. When deserialization
-    /// fails, returns Internal with the raw response as context.
-    fn parse_error_response(status: reqwest::StatusCode, content: &str) -> lance_core::Error {
+    /// fails, returns Internal with the raw response as context. Throttling
+    /// errors additionally carry the normalized `Retry-After` header, when the
+    /// server sent one.
+    fn parse_error_response(
+        status: reqwest::StatusCode,
+        headers: &HeaderMap,
+        content: &str,
+    ) -> lance_core::Error {
         match serde_json::from_str::<ErrorResponse>(content) {
             Ok(err_resp) => {
                 let message = err_resp.error.as_deref().unwrap_or(content);
-                NamespaceError::from_code(err_resp.code as u32, message).into()
+                if err_resp.code == ErrorCode::Throttling.as_u32() as i32 {
+                    NamespaceError::Throttling {
+                        message: message.to_string(),
+                        retry_after: parse_retry_after(headers),
+                    }
+                    .into()
+                } else {
+                    NamespaceError::from_code(err_resp.code as u32, message).into()
+                }
             }
             Err(e) => NamespaceError::Internal {
                 message: format!(
@@ -744,6 +771,7 @@ impl RestNamespace {
         } else {
             Err(Self::parse_error_response(
                 status,
+                &headers,
                 &String::from_utf8_lossy(&content),
             ))
         }
@@ -900,6 +928,81 @@ impl RestNamespace {
         if let Some(ref metrics) = self.ops_metrics {
             metrics.increment(operation);
         }
+    }
+
+    /// Merge `extra` scalar entries into `request`'s JSON serialization,
+    /// without clobbering any field the typed request already sets. Returns
+    /// the plain typed request when `extra` is empty, so the common case
+    /// pays no serialization cost.
+    fn merge_extra_options<T: Serialize>(
+        request: &T,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::to_value(request).map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to serialize request: {:?}", e),
+            })
+        })?;
+        if let serde_json::Value::Object(map) = &mut body {
+            for (key, value) in extra {
+                map.entry(key).or_insert(value);
+            }
+        }
+        Ok(body)
+    }
+
+    /// Like [`LanceNamespace::alter_table_backfill_columns`], but also
+    /// forwards `extra` -- opaque scalar options the generated
+    /// `AlterTableBackfillColumnsRequest` doesn't declare a field for.
+    ///
+    /// The generated request model only knows the fields that existed in
+    /// the `lance-namespace` spec when it was last regenerated, so a caller
+    /// building a request from a dynamically-typed source (e.g. a language
+    /// binding depythonizing a caller-supplied object) can hold a knob the
+    /// model has no slot for. Merging it into the JSON body here forwards it
+    /// anyway, the same way Phalanx's REST handler already accepts an
+    /// opaque `options` bag on the receiving end -- so a knob doesn't need a
+    /// schema bump on both sides just to reach the server.
+    pub async fn alter_table_backfill_columns_with_extra(
+        &self,
+        request: AlterTableBackfillColumnsRequest,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<AlterTableBackfillColumnsResponse> {
+        self.record_op("alter_table_backfill_columns");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/table/{}/backfill_column", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        if extra.is_empty() {
+            return self
+                .post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+                .await;
+        }
+        let body = Self::merge_extra_options(&request, extra)?;
+        self.post_json(&path, &query, &body, "alter_table_backfill_columns", &id)
+            .await
+    }
+
+    /// See [`Self::alter_table_backfill_columns_with_extra`] -- same idea,
+    /// for `refresh_materialized_view`.
+    pub async fn refresh_materialized_view_with_extra(
+        &self,
+        request: RefreshMaterializedViewRequest,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<RefreshMaterializedViewResponse> {
+        self.record_op("refresh_materialized_view");
+        let id = object_id_str(&request.id, &self.delimiter)?;
+        let encoded_id = urlencode(&id);
+        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
+        let query = [("delimiter", self.delimiter.as_str())];
+        if extra.is_empty() {
+            return self
+                .post_json(&path, &query, &request, "refresh_materialized_view", &id)
+                .await;
+        }
+        let body = Self::merge_extra_options(&request, extra)?;
+        self.post_json(&path, &query, &body, "refresh_materialized_view", &id)
+            .await
     }
 }
 
@@ -1638,12 +1741,7 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: AlterTableBackfillColumnsRequest,
     ) -> Result<AlterTableBackfillColumnsResponse> {
-        self.record_op("alter_table_backfill_columns");
-        let id = object_id_str(&request.id, &self.delimiter)?;
-        let encoded_id = urlencode(&id);
-        let path = format!("/v1/table/{}/backfill_column", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "alter_table_backfill_columns", &id)
+        self.alter_table_backfill_columns_with_extra(request, serde_json::Map::new())
             .await
     }
 
@@ -1651,12 +1749,7 @@ impl LanceNamespace for RestNamespace {
         &self,
         request: RefreshMaterializedViewRequest,
     ) -> Result<RefreshMaterializedViewResponse> {
-        self.record_op("refresh_materialized_view");
-        let id = object_id_str(&request.id, &self.delimiter)?;
-        let encoded_id = urlencode(&id);
-        let path = format!("/v1/materialized_view/{}/refresh", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json(&path, &query, &request, "refresh_materialized_view", &id)
+        self.refresh_materialized_view_with_extra(request, serde_json::Map::new())
             .await
     }
 
@@ -2133,6 +2226,58 @@ mod tests {
         assert!(result.is_err());
     }
 
+    async fn throttling_error_with_retry_after(retry_after: Option<&str>) -> lance_core::Error {
+        let mock_server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "code": 21,
+            "error": "Too many requests",
+        }));
+        if let Some(retry_after) = retry_after {
+            response = response.insert_header("Retry-After", retry_after);
+        }
+        Mock::given(method("GET"))
+            .and(path("/v1/namespace/test/list"))
+            .respond_with(response)
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+        let request = ListNamespacesRequest {
+            id: Some(vec!["test".to_string()]),
+            ..Default::default()
+        };
+        namespace
+            .list_namespaces(request)
+            .await
+            .expect_err("throttling response should fail")
+    }
+
+    #[tokio::test]
+    async fn test_throttling_error_preserves_retry_after() {
+        let err = throttling_error_with_retry_after(Some("2")).await;
+        let Error::Namespace { source, .. } = err else {
+            panic!("expected namespace error, got {err:?}");
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected NamespaceError source");
+        assert_eq!(ns_err.code(), ErrorCode::Throttling);
+        assert_eq!(ns_err.retry_after(), Some(Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn test_throttling_error_without_retry_after() {
+        let err = throttling_error_with_retry_after(None).await;
+        let Error::Namespace { source, .. } = err else {
+            panic!("expected namespace error, got {err:?}");
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected NamespaceError source");
+        assert_eq!(ns_err.code(), ErrorCode::Throttling);
+        assert_eq!(ns_err.retry_after(), None);
+    }
+
     #[tokio::test]
     async fn test_create_namespace_success() {
         // Start a mock server
@@ -2484,5 +2629,124 @@ mod tests {
 
         let result = namespace.list_namespaces(request).await;
         assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_backfill_columns_with_extra_forwards_unknown_fields() {
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/backfill_column".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "job_id": "job-123"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = AlterTableBackfillColumnsRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            column: "embedding".to_string(),
+            concurrency: Some(Some(4)),
+            ..Default::default()
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("use_cpu_only_pool".to_string(), serde_json::json!(true));
+        extra.insert("task_size".to_string(), serde_json::json!(65536));
+
+        let result = namespace
+            .alter_table_backfill_columns_with_extra(request, extra)
+            .await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        assert_eq!(result.unwrap().job_id, "job-123");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+
+        // Fields the typed request declares are still there, untouched.
+        assert_eq!(body["column"], serde_json::json!("embedding"));
+        assert_eq!(body["concurrency"], serde_json::json!(4));
+        // Fields the typed request has no slot for made it through anyway.
+        assert_eq!(body["use_cpu_only_pool"], serde_json::json!(true));
+        assert_eq!(body["task_size"], serde_json::json!(65536));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_backfill_columns_with_extra_empty_matches_plain_request() {
+        // With no extras, the two call styles should be indistinguishable.
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/table/test$namespace$table/backfill_column".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "job_id": "job-456"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = AlterTableBackfillColumnsRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "table".to_string(),
+            ]),
+            column: "embedding".to_string(),
+            ..Default::default()
+        };
+
+        let result = namespace.alter_table_backfill_columns(request).await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert!(body.get("use_cpu_only_pool").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_materialized_view_with_extra_forwards_unknown_fields() {
+        let mock_server = MockServer::start().await;
+
+        let path_str = "/v1/materialized_view/test$namespace$view/refresh".replace("$", "%24");
+        Mock::given(method("POST"))
+            .and(path(path_str.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "job_id": "job-789"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let namespace = RestNamespaceBuilder::new(mock_server.uri()).build();
+
+        let request = RefreshMaterializedViewRequest {
+            id: Some(vec![
+                "test".to_string(),
+                "namespace".to_string(),
+                "view".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let mut extra = serde_json::Map::new();
+        extra.insert("max_rows_per_fragment".to_string(), serde_json::json!(1000));
+
+        let result = namespace
+            .refresh_materialized_view_with_extra(request, extra)
+            .await;
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["max_rows_per_fragment"], serde_json::json!(1000));
     }
 }

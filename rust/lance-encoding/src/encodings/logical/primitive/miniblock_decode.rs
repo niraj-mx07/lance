@@ -8,24 +8,37 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::{iter, vec};
 
+#[cfg(feature = "bitpacking")]
+use arrow_buffer::ArrowNativeType;
 use arrow_buffer::ScalarBuffer;
+#[cfg(feature = "bitpacking")]
+use bytemuck::Pod;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
+#[cfg(feature = "bitpacking")]
+use lance_bitpacking::BitPackingUninit;
 use lance_core::Result;
-use lance_core::cache::{Context, DeepSizeOf};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::error::Error;
 use lance_core::utils::bit::pad_bytes;
 
+use super::structure::{StructuralMetadataIo, StructuralProjection};
 use crate::EncodingsIo;
 use crate::buffer::LanceBuffer;
 use crate::compression::{BlockDecompressor, DecompressionStrategy, MiniBlockDecompressor};
+#[cfg(feature = "bitpacking")]
+use crate::data::{BlockInfo, FixedWidthDataBlock};
 use crate::data::{DataBlock, DataBlockBuilder, DictionaryDataBlock};
 use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
+#[cfg(feature = "bitpacking")]
+use crate::encodings::physical::bitpacking::InlineBitpacking;
 use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
+
+mod structure;
 
 use super::chunk_index::{
     ItemCounts, MiniBlockChunkIndex, PrefixSums, RowMapping, parse_nested_rep,
@@ -43,6 +56,14 @@ struct DecodedMiniBlockChunk {
     values: DataBlock,
 }
 
+/// The raw sections of a serialized mini-block chunk.
+struct MiniBlockChunkSections {
+    num_levels: u16,
+    rep: Option<LanceBuffer>,
+    def: Option<LanceBuffer>,
+    value_buffers: Vec<LanceBuffer>,
+}
+
 /// A task to decode a one or more mini-blocks of data into an output batch
 ///
 /// Note: Two batches might share the same mini-block of data.  When this happens
@@ -52,6 +73,7 @@ struct DecodedMiniBlockChunk {
 /// the decoding of the block. (TODO: test this theory)
 #[derive(Debug)]
 struct DecodeMiniBlockTask {
+    structural_projection: Option<StructuralProjection>,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -64,6 +86,105 @@ struct DecodeMiniBlockTask {
 }
 
 impl DecodeMiniBlockTask {
+    #[cfg(feature = "bitpacking")]
+    fn decode_inline_bitpacking<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
+        &self,
+    ) -> Result<DecodedPage> {
+        let num_values = self
+            .instructions
+            .iter()
+            .try_fold(0_u64, |total, (instruction, _)| {
+                total.checked_add(instruction.rows_to_take)
+            })
+            .ok_or_else(|| {
+                Error::corrupt_file_named("mini-block", "selected value count overflow")
+            })?;
+        let capacity = usize::try_from(num_values).map_err(|_| {
+            Error::corrupt_file_named("mini-block", "selected value count exceeds usize")
+        })?;
+        let output_bytes = capacity
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| {
+                Error::corrupt_file_named("mini-block", "decoded output size overflow")
+            })?;
+        if output_bytes > isize::MAX as usize {
+            return Err(Error::corrupt_file_named(
+                "mini-block",
+                format!("decoded output size {output_bytes} exceeds isize::MAX"),
+            ));
+        }
+        let mut output = Vec::<T>::with_capacity(capacity);
+        let mut scratch = Vec::<T>::new();
+        let mut cached_chunk_idx = None;
+
+        for (instruction, chunk) in &self.instructions {
+            let header_size = if self.has_large_chunk { 6 } else { 4 };
+            let header = chunk.data.get(..header_size).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "mini-block",
+                    format!(
+                        "one-buffer header needs {header_size} bytes, got {}",
+                        chunk.data.len()
+                    ),
+                )
+            })?;
+            let payload_size = if self.has_large_chunk {
+                u32::from_le_bytes(header[2..6].try_into().map_err(|_| {
+                    Error::corrupt_file_named("mini-block", "truncated large buffer size")
+                })?) as usize
+            } else {
+                u16::from_le_bytes(header[2..4].try_into().map_err(|_| {
+                    Error::corrupt_file_named("mini-block", "truncated buffer size")
+                })?) as usize
+            };
+            let payload_start = header_size
+                .checked_add(pad_bytes::<MINIBLOCK_ALIGNMENT>(header_size))
+                .ok_or_else(|| {
+                    Error::corrupt_file_named("mini-block", "payload offset overflow")
+                })?;
+            let payload_end = payload_start
+                .checked_add(payload_size)
+                .ok_or_else(|| Error::corrupt_file_named("mini-block", "payload end overflow"))?;
+            if payload_end > chunk.data.len() {
+                return Err(Error::corrupt_file_named(
+                    "mini-block",
+                    format!(
+                        "payload ends at {payload_end}, beyond chunk size {}",
+                        chunk.data.len()
+                    ),
+                ));
+            }
+            let payload = chunk.data.slice_with_length(payload_start, payload_size);
+            let start = instruction
+                .rows_to_skip
+                .checked_add(instruction.chunk_instructions.rows_to_skip)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named("mini-block", "selection start overflow")
+                })?;
+            let end = start
+                .checked_add(instruction.rows_to_take)
+                .ok_or_else(|| Error::corrupt_file_named("mini-block", "selection end overflow"))?;
+            InlineBitpacking::append_selected::<T>(
+                &payload,
+                chunk.items_in_chunk,
+                start..end,
+                chunk.chunk_idx,
+                &mut output,
+                &mut scratch,
+                &mut cached_chunk_idx,
+            )?;
+        }
+
+        let data = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(output),
+            bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let repdef = RepDefUnraveler::new(None, None, self.def_meaning.clone(), num_values);
+        Ok(DecodedPage { data, repdef })
+    }
+
     fn decoded_size_bytes(&self) -> Option<u64> {
         if self.rep_decompressor.is_some() || self.def_decompressor.is_some() {
             return None;
@@ -492,21 +613,16 @@ impl DecodeMiniBlockTask {
             .collect()
     }
 
-    // Unserialize a miniblock into a collection of vectors
-    fn decode_miniblock_chunk(
-        &self,
+    fn split_miniblock_chunk(
         buf: &LanceBuffer,
-        items_in_chunk: u64,
-    ) -> Result<DecodedMiniBlockChunk> {
-        let header_size = self
-            .num_buffers
-            .checked_mul(if self.has_large_chunk { 4 } else { 2 })
-            .and_then(|size| {
-                size.checked_add(
-                    2 + 2 * u64::from(self.rep_decompressor.is_some())
-                        + 2 * u64::from(self.def_decompressor.is_some()),
-                )
-            });
+        has_rep: bool,
+        has_def: bool,
+        num_buffers: u64,
+        has_large_chunk: bool,
+    ) -> Result<MiniBlockChunkSections> {
+        let header_size = num_buffers
+            .checked_mul(if has_large_chunk { 4 } else { 2 })
+            .and_then(|size| size.checked_add(2 + 2 * u64::from(has_rep) + 2 * u64::from(has_def)));
         if header_size.is_none_or(|size| size > buf.len() as u64) {
             return Err(Error::corrupt_file_named(
                 "miniblock_levels",
@@ -517,14 +633,14 @@ impl DecodeMiniBlockTask {
         let num_levels = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
         offset += 2;
 
-        let rep_size = if self.rep_decompressor.is_some() {
+        let rep_size = if has_rep {
             let rep_size = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
             offset += 2;
             Some(rep_size)
         } else {
             None
         };
-        let def_size = if self.def_decompressor.is_some() {
+        let def_size = if has_def {
             let def_size = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
             offset += 2;
             Some(def_size)
@@ -532,10 +648,10 @@ impl DecodeMiniBlockTask {
             None
         };
 
-        let buffer_sizes = if self.has_large_chunk {
-            Self::read_buffer_sizes::<true>(buf, &mut offset, self.num_buffers)
+        let buffer_sizes = if has_large_chunk {
+            Self::read_buffer_sizes::<true>(buf, &mut offset, num_buffers)
         } else {
-            Self::read_buffer_sizes::<false>(buf, &mut offset, self.num_buffers)
+            Self::read_buffer_sizes::<false>(buf, &mut offset, num_buffers)
         };
 
         offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
@@ -571,6 +687,38 @@ impl DecodeMiniBlockTask {
             .map(|size| take_buffer(&mut offset, size as usize))
             .transpose()?;
 
+        let value_buffers = buffer_sizes
+            .into_iter()
+            .map(|size| take_buffer(&mut offset, size as usize))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(MiniBlockChunkSections {
+            num_levels,
+            rep,
+            def,
+            value_buffers,
+        })
+    }
+
+    // Unserialize a miniblock into a collection of vectors
+    fn decode_miniblock_chunk(
+        &self,
+        buf: &LanceBuffer,
+        items_in_chunk: u64,
+    ) -> Result<DecodedMiniBlockChunk> {
+        let MiniBlockChunkSections {
+            num_levels,
+            rep,
+            def,
+            value_buffers,
+        } = Self::split_miniblock_chunk(
+            buf,
+            self.rep_decompressor.is_some(),
+            self.def_decompressor.is_some(),
+            self.num_buffers,
+            self.has_large_chunk,
+        )?;
+
         let num_levels = Self::resolve_num_levels(
             self.rep_decompressor.as_deref(),
             rep.as_ref(),
@@ -579,14 +727,14 @@ impl DecodeMiniBlockTask {
             num_levels,
         )?;
 
-        let buffers = buffer_sizes
-            .into_iter()
-            .map(|size| take_buffer(&mut offset, size as usize))
-            .collect::<Result<Vec<_>>>()?;
-
-        let values = self
-            .value_decompressor
-            .decompress(buffers, items_in_chunk)?;
+        let values = if self.structural_projection.is_some() {
+            DataBlock::AllNull(crate::data::AllNullDataBlock {
+                num_values: items_in_chunk,
+            })
+        } else {
+            self.value_decompressor
+                .decompress(value_buffers, items_in_chunk)?
+        };
 
         let rep = rep
             .map(|rep| {
@@ -626,6 +774,25 @@ impl DecodeMiniBlockTask {
 
 impl DecodePageTask for DecodeMiniBlockTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        #[cfg(feature = "bitpacking")]
+        if self.rep_decompressor.is_none()
+            && self.structural_projection.is_none()
+            && self.def_decompressor.is_none()
+            && self.dictionary_data.is_none()
+            && self.num_buffers == 1
+            && let Some(width) = self.value_decompressor.inline_bitpacking_width()
+        {
+            return match width {
+                8 => self.decode_inline_bitpacking::<u8>(),
+                16 => self.decode_inline_bitpacking::<u16>(),
+                32 => self.decode_inline_bitpacking::<u32>(),
+                64 => self.decode_inline_bitpacking::<u64>(),
+                _ => Err(Error::corrupt_file_named(
+                    "inline_bitpacking",
+                    format!("unsupported output width {width}"),
+                )),
+            };
+        }
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
@@ -709,6 +876,11 @@ impl DecodePageTask for DecodeMiniBlockTask {
         }
 
         let mut data = data_builder.finish();
+        if let Some(projection) = &self.structural_projection {
+            // Slice and concatenate structural item counts before constructing
+            // one type-correct placeholder array for the requested batch.
+            data = projection.placeholder_values(data.num_values())?;
+        }
 
         let unraveler =
             RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values());
@@ -740,6 +912,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
 /// [`PrimitiveStructuralEncoder`]: crate::encodings::logical::primitive::PrimitiveStructuralEncoder
 #[derive(Debug)]
 struct MiniBlockDecoder {
+    structural_projection: Option<StructuralProjection>,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -756,6 +929,170 @@ struct MiniBlockDecoder {
 /// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
 /// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
+    fn dictionary_len(&self) -> Option<u64> {
+        self.dictionary
+            .as_ref()
+            .map(|dictionary| dictionary.num_values())
+    }
+
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if self.structural_projection.is_some() {
+            return Err(Error::not_supported(
+                "Byte planning is unavailable for structural list reads",
+            ));
+        }
+        if num_rows == 0 {
+            return Ok(0);
+        }
+        if let Some(dictionary) = &self.dictionary {
+            // Decoded dictionary indices are at most 64 bits wide and the shared
+            // dictionary block is counted once per drained batch.
+            let index_bytes = num_rows.checked_mul(8).ok_or_else(|| {
+                Error::not_supported(
+                    "decoded_bytes: dictionary index byte count overflowed u64".to_string(),
+                )
+            })?;
+            return dictionary
+                .data_size()
+                .checked_add(index_bytes)
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "decoded_bytes: dictionary byte count overflowed u64".to_string(),
+                    )
+                });
+        }
+
+        let max_rep = self
+            .def_meaning
+            .iter()
+            .filter(|level| level.is_list())
+            .count() as u16;
+        let max_visible_level = max_visible_level(&self.def_meaning);
+        let mut rows_desired = num_rows;
+        let mut need_preamble = false;
+        let mut skip_in_chunk = self.offset_in_current_chunk;
+        let mut instruction_idx = 0usize;
+        let mut total_bytes = 0u64;
+
+        while rows_desired > 0 || need_preamble {
+            let instruction = self.instructions.get(instruction_idx).ok_or_else(|| {
+                Error::not_supported(
+                    "decoded_bytes: drain instructions do not cover the requested rows".to_string(),
+                )
+            })?;
+            let (drain_inst, consumed) = instruction.drain_from_instruction(
+                &mut rows_desired,
+                &mut need_preamble,
+                &mut skip_in_chunk,
+            );
+            if consumed {
+                instruction_idx += 1;
+            }
+
+            let chunk = self
+                .loaded_chunks
+                .iter()
+                .find(|chunk| chunk.chunk_idx == drain_inst.chunk_instructions.chunk_idx)
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "decoded_bytes: chunk not loaded for miniblock decoder".to_string(),
+                    )
+                })?;
+            let sections = DecodeMiniBlockTask::split_miniblock_chunk(
+                &chunk.data,
+                self.rep_decompressor.is_some(),
+                self.def_decompressor.is_some(),
+                self.num_buffers,
+                self.has_large_chunk,
+            )?;
+            let num_levels = DecodeMiniBlockTask::resolve_num_levels(
+                self.rep_decompressor.as_deref(),
+                sections.rep.as_ref(),
+                self.def_decompressor.as_deref(),
+                sections.def.as_ref(),
+                sections.num_levels,
+            )?;
+            let rep = sections
+                .rep
+                .map(|rep| {
+                    let decompressor = self.rep_decompressor.as_ref().ok_or_else(|| {
+                        Error::internal("miniblock repetition decompressor is missing")
+                    })?;
+                    DecodeMiniBlockTask::decode_levels(decompressor.as_ref(), rep, num_levels)
+                })
+                .transpose()?;
+            let def = sections
+                .def
+                .map(|def| {
+                    let decompressor = self.def_decompressor.as_ref().ok_or_else(|| {
+                        Error::internal("miniblock definition decompressor is missing")
+                    })?;
+                    DecodeMiniBlockTask::decode_levels(decompressor.as_ref(), def, num_levels)
+                })
+                .transpose()?;
+
+            let row_range_start = drain_inst
+                .rows_to_skip
+                .checked_add(drain_inst.chunk_instructions.rows_to_skip)
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "decoded_bytes: miniblock row range start overflowed u64".to_string(),
+                    )
+                })?;
+            let row_range_end = row_range_start
+                .checked_add(drain_inst.rows_to_take)
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "decoded_bytes: miniblock row range end overflowed u64".to_string(),
+                    )
+                })?;
+            let (item_range, _) = DecodeMiniBlockTask::map_range(
+                row_range_start..row_range_end,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_level,
+                chunk.items_in_chunk,
+                drain_inst.preamble_action,
+            );
+            if item_range.end > chunk.items_in_chunk {
+                return Err(Error::corrupt_file_named(
+                    "miniblock",
+                    format!(
+                        "decoded byte planning selected items {:?} from a chunk with {} items",
+                        item_range, chunk.items_in_chunk
+                    ),
+                ));
+            }
+            let item_count = item_range
+                .end
+                .checked_sub(item_range.start)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "miniblock",
+                        format!(
+                            "decoded byte planning selected a reversed item range {item_range:?}"
+                        ),
+                    )
+                })?;
+            let chunk_bytes = self
+                .value_decompressor
+                .decoded_bytes_from_chunk(&sections.value_buffers, item_range.start, item_count)
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "decoded_bytes is not implemented for this value decompressor".to_string(),
+                    )
+                })?;
+            total_bytes = total_bytes.checked_add(chunk_bytes).ok_or_else(|| {
+                Error::not_supported(
+                    "decoded_bytes: miniblock decoded byte count overflowed u64".to_string(),
+                )
+            })?;
+        }
+
+        Ok(total_bytes)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let mut items_desired = num_rows;
         let mut need_preamble = false;
@@ -785,6 +1122,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         let max_visible_level = max_visible_level(&self.def_meaning);
 
         Ok(Box::new(DecodeMiniBlockTask {
+            structural_projection: self.structural_projection.clone(),
             instructions: drain_instructions,
             def_decompressor: self.def_decompressor.clone(),
             rep_decompressor: self.rep_decompressor.clone(),
@@ -865,6 +1203,8 @@ impl CachedPageData for MiniBlockCacheableState {
 /// `ChunkDrainInstructions`.
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
+    pub(super) structural_projection: Option<StructuralProjection>,
+    structural_cache: Option<Arc<LanceCache>>,
     // These come from the protobuf
     pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
@@ -910,8 +1250,8 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-            .collect::<Vec<_>>();
+            .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+            .collect::<Result<Vec<_>>>()?;
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
             decompressors,
@@ -924,7 +1264,15 @@ impl MiniBlockScheduler {
                 .into();
             let dictionary_data_alignment = match dictionary_encoding.compression.as_ref().unwrap()
             {
-                Compression::Variable(_) => 4,
+                // The header is two offsets wide, so this aligns the offsets too
+                Compression::Variable(variable) => match variable
+                    .offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.compression.as_ref())
+                {
+                    Some(Compression::Flat(offsets)) if offsets.bits_per_value == 64 => 8,
+                    _ => 4,
+                },
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
                 Compression::FixedSizeList(_) => 1,
@@ -958,6 +1306,8 @@ impl MiniBlockScheduler {
 
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
+            structural_projection: None,
+            structural_cache: None,
             rep_decompressor,
             def_decompressor,
             value_decompressor: value_decompressor.into(),
@@ -1124,22 +1474,25 @@ impl ChunkInstructions {
                 // These blocks have no rows to take but may have a preamble we need
                 // We only look for preamble if to_skip == 0 (we're not skipping rows)
                 if rows_avail == 0 && to_skip == 0 {
-                    // Only process if this chunk has a preamble we need
-                    if has_preamble && need_preamble {
-                        chunk_instructions.push(Self {
-                            chunk_idx: block_index,
-                            preamble: PreambleAction::Take,
-                            rows_to_skip: 0,
-                            rows_to_take: 0,
-                            // We still need to look at has_trailer to distinguish between "all preamble
-                            // and row ends at end of chunk" and "all preamble and row bleeds into next
-                            // chunk".  Both cases will have 0 rows available.
-                            take_trailer: has_trailer,
-                        });
-                        // Only set need_preamble = false if the chunk has at least one row,
-                        // Or we are reaching the last block,
-                        // Otherwise, the chunk is entirely preamble and we need the next chunk's preamble too
-                        if starts_including_trailer > 0 || block_index == num_chunks - 1 {
+                    if need_preamble {
+                        if has_preamble {
+                            chunk_instructions.push(Self {
+                                chunk_idx: block_index,
+                                preamble: PreambleAction::Take,
+                                rows_to_skip: 0,
+                                rows_to_take: 0,
+                                // We still need to look at has_trailer to distinguish between "all preamble
+                                // and row ends at end of chunk" and "all preamble and row bleeds into next
+                                // chunk".  Both cases will have 0 rows available.
+                                take_trailer: has_trailer,
+                            });
+                            // Continue looking for a preamble only while the row actually
+                            // bleeds into the next chunk.  Once the row ends (no trailer),
+                            // the next chunk starts a new row and carries no preamble.
+                            need_preamble = has_trailer && block_index + 1 < num_chunks;
+                        } else {
+                            // The previous row ended at the previous chunk boundary, so
+                            // there is nothing left to continue.
                             need_preamble = false;
                         }
                     }
@@ -1285,6 +1638,26 @@ impl ChunkInstructions {
             consumed_chunk,
         )
     }
+}
+
+/// Checks that the chunk index maps exactly the requested rows.
+///
+/// The chunk index comes from the file.  A mismatch means the page's row mapping does not
+/// cover the requested rows, so decoding it would produce the wrong number of rows.
+fn ensure_scheduled_rows(num_rows: u64, instructions: &[ChunkInstructions]) -> Result<()> {
+    let scheduled_rows = instructions
+        .iter()
+        .map(|instructions| instructions.rows_to_take)
+        .sum::<u64>();
+    if num_rows != scheduled_rows {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "Mini-block chunk index maps {num_rows} requested rows to {scheduled_rows} rows"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 enum Words {
@@ -1433,6 +1806,12 @@ fn build_chunk_index(
     repetition_index_depth: u16,
 ) -> Result<MiniBlockChunkIndex> {
     let num_chunks = words.len();
+    if num_chunks == 0 {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            "mini-block page has no chunk metadata",
+        ));
+    }
     // Validate item counts before byte sizes because both share a metadata word,
     // and an invalid count must not reach the final-chunk subtraction.
     let value_counts = analyze_value_counts(words, items_in_page)?;
@@ -1475,9 +1854,26 @@ fn build_chunk_index(
     // Nested pages track rows via the repetition index and keep leaf item counts
     // separately; flat pages have row == value index, so value counts are rows.
     let rows = if let Some(rep_index_data) = rep_index_bytes {
-        assert!(rep_index_data.len() % 8 == 0);
+        if rep_index_data.len() % 8 != 0 {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "repetition index has {} bytes, which is not a whole number of u64 words",
+                    rep_index_data.len()
+                ),
+            ));
+        }
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
+        if row_starts.num_chunks() != num_chunks || has_trailer.len() != num_chunks.div_ceil(8) {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "repetition index covers {} chunks but the page has {num_chunks} chunks",
+                    row_starts.num_chunks()
+                ),
+            ));
+        }
         let item_counts = if value_counts.uniform {
             ItemCounts::Uniform {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -1489,17 +1885,12 @@ fn build_chunk_index(
                 last_chunk_values: value_counts.last_chunk_values,
             }
         };
-        RowMapping::Nested {
-            row_starts,
-            has_trailer,
-            item_counts,
-        }
+        RowMapping::nested(row_starts, has_trailer, item_counts)
     } else {
         if value_counts.uniform {
             RowMapping::UniformFlat {
                 values_per_chunk: value_counts.values_per_chunk,
                 last_chunk_values: value_counts.last_chunk_values,
-                num_chunks,
             }
         } else {
             let value_starts = PrefixSums::from_deltas(
@@ -1515,16 +1906,23 @@ fn build_chunk_index(
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        self.structural_cache = self.structural_projection.is_some().then_some(cache);
+    }
     fn init_layout(&self) -> Result<PageInitialization> {
         // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
         // need.
         let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
-        let dictionary_range = self.dictionary.as_ref().map(|dictionary| {
-            dictionary.dictionary_buf_position_and_size.0
-                ..dictionary.dictionary_buf_position_and_size.0
-                    + dictionary.dictionary_buf_position_and_size.1
-        });
+        let dictionary_range = self
+            .dictionary
+            .as_ref()
+            .filter(|_| self.structural_projection.is_none())
+            .map(|dictionary| {
+                dictionary.dictionary_buf_position_and_size.0
+                    ..dictionary.dictionary_buf_position_and_size.0
+                        + dictionary.dictionary_buf_position_and_size.1
+            });
         let repetition_index_range = if self.repetition_index_depth > 0 {
             let (rep_index_pos, rep_index_size) =
                 self.buffer_offsets_and_sizes.last().ok_or_else(|| {
@@ -1579,6 +1977,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                         dictionary.num_dictionary_items,
                     )?))
                 }
+                (_, None) if self.structural_projection.is_some() => None,
                 (None, None) => None,
                 _ => {
                     return Err(Error::internal(
@@ -1608,20 +2007,24 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+        let num_rows = ranges.iter().try_fold(0u64, |total, range| {
+            range
+                .end
+                .checked_sub(range.start)
+                .and_then(|len| total.checked_add(len))
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Invalid requested row range {range:?}"))
+                })
+        })?;
 
-        let page_meta = self.page_meta.as_ref().unwrap();
+        let page_meta = self.page_meta.as_ref().ok_or_else(|| {
+            Error::internal("Mini-block page was scheduled before its metadata was loaded")
+        })?;
 
         let chunk_instructions =
             ChunkInstructions::schedule_instructions(&page_meta.chunk_index, ranges);
 
-        debug_assert_eq!(
-            num_rows,
-            chunk_instructions
-                .iter()
-                .map(|ci| ci.rows_to_take)
-                .sum::<u64>()
-        );
+        ensure_scheduled_rows(num_rows, &chunk_instructions)?;
 
         let chunks_needed = chunk_instructions
             .iter()
@@ -1634,7 +2037,20 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .iter()
             .map(|c| c.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
+        let loaded_chunk_data = if self.structural_projection.is_some() {
+            structure::read_chunks(
+                StructuralMetadataIo::wrap(io.clone(), self.structural_cache.clone()),
+                chunk_ranges,
+                self.num_buffers,
+                self.rep_decompressor.is_some(),
+                self.def_decompressor.is_some(),
+                self.has_large_chunk,
+                self.priority,
+            )
+        } else {
+            io.submit_request(chunk_ranges, self.priority)
+        };
+        let structural_projection = self.structural_projection.clone();
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
@@ -1654,6 +2070,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             }
 
             Ok(Box::new(MiniBlockDecoder {
+                structural_projection,
                 rep_decompressor,
                 def_decompressor,
                 value_decompressor,
@@ -1682,26 +2099,34 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
+    use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use bytes::Bytes;
-    use lance_core::cache::{Context, DeepSizeOf};
+    #[cfg(feature = "bitpacking")]
+    use lance_bitpacking::BitPacking;
+    use lance_core::cache::DeepSizeOf;
     use rstest::rstest;
 
     use crate::buffer::LanceBuffer;
-    use crate::compression::{DefaultDecompressionStrategy, MiniBlockDecompressor};
+    use crate::compression::{
+        BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
+    };
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-    use crate::decoder::DecodePageTask;
+    use crate::decoder::{DecodePageTask, StructuralPageDecoder};
     use crate::encodings::logical::primitive::chunk_index::{
         MiniBlockChunkIndex, PrefixSums, RowMapping,
     };
     use crate::encodings::logical::primitive::tests::encoded_u16_frame;
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
+    use crate::encodings::physical::binary::VariableEncoder;
+    #[cfg(feature = "bitpacking")]
+    use crate::encodings::physical::bitpacking::InlineBitpacking;
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
     use crate::encodings::physical::value::ValueDecompressor;
     use crate::format::{EncodingUtils, metadata};
 
     use super::{
-        ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, PreambleAction, Words,
-        build_chunk_index,
+        ChunkDrainInstructions, ChunkInstructions, DecodeMiniBlockTask, MiniBlockDecoder,
+        PreambleAction, Words, build_chunk_index,
     };
 
     #[test]
@@ -1740,6 +2165,7 @@ mod tests {
         chunk_data.resize(chunk_data.len() + expected_size as usize, 7);
 
         let task = DecodeMiniBlockTask {
+            structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
             value_decompressor: Arc::new(FixedWidthMiniBlockDecompressor),
@@ -1777,6 +2203,215 @@ mod tests {
             values.data.clone().into_buffer().capacity(),
             expected_size as usize
         );
+    }
+
+    #[test]
+    fn test_miniblock_planned_binary_bytes_match_partial_drain() {
+        use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
+
+        fn binary_value_buffer(values: &[&[u8]]) -> Vec<u8> {
+            let header_bytes = (values.len() as u32 + 1) * 4;
+            let mut offsets = vec![header_bytes];
+            let mut current = header_bytes;
+            for value in values {
+                current += value.len() as u32;
+                offsets.push(current);
+            }
+            let mut buffer = offsets
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            for value in values {
+                buffer.extend_from_slice(value);
+            }
+            buffer.resize(buffer.len().next_multiple_of(4), 0);
+            buffer
+        }
+
+        fn miniblock_chunk(value_buffer: &[u8]) -> LanceBuffer {
+            let mut chunk = Vec::new();
+            chunk.extend_from_slice(&0_u16.to_le_bytes());
+            chunk.extend_from_slice(&(value_buffer.len() as u16).to_le_bytes());
+            let padding =
+                lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
+            chunk.resize(chunk.len() + padding, 0);
+            chunk.extend_from_slice(value_buffer);
+            let padding =
+                lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
+            chunk.resize(chunk.len() + padding, 0);
+            LanceBuffer::from(chunk)
+        }
+
+        let values: Vec<&[u8]> = vec![b"aa", b"bb", b"ccc", b"d", b"eeeee"];
+        let chunk_data = miniblock_chunk(&binary_value_buffer(&values));
+        let mut decoder = MiniBlockDecoder {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::from([LoadedChunk {
+                data: chunk_data,
+                items_in_chunk: values.len() as u64,
+                byte_range: 0..0,
+                chunk_idx: 0,
+            }]),
+            instructions: VecDeque::from([ChunkInstructions {
+                chunk_idx: 0,
+                preamble: PreambleAction::Absent,
+                rows_to_skip: 0,
+                rows_to_take: values.len() as u64,
+                take_trailer: false,
+            }]),
+            offset_in_current_chunk: 0,
+            num_rows: values.len() as u64,
+            num_buffers: 1,
+            dictionary: None,
+            has_large_chunk: false,
+        };
+
+        decoder.drain(2).unwrap().decode().unwrap();
+        let planned = decoder.decoded_bytes(3).unwrap();
+        let actual = decoder.drain(3).unwrap().decode().unwrap();
+        assert_eq!(planned, actual.data.data_size());
+    }
+
+    #[test]
+    fn test_miniblock_planned_dictionary_bytes_include_shared_values() {
+        use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
+
+        let dictionary = Arc::new(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8; 64]),
+            bits_per_value: 8,
+            num_values: 8,
+            block_info: BlockInfo::new(),
+        }));
+        let decoder = MiniBlockDecoder {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::new(),
+            instructions: VecDeque::new(),
+            offset_in_current_chunk: 0,
+            num_rows: 3,
+            num_buffers: 1,
+            dictionary: Some(dictionary),
+            has_large_chunk: false,
+        };
+
+        assert_eq!(decoder.dictionary_len(), Some(8));
+        assert_eq!(decoder.decoded_bytes(3).unwrap(), 64 + 3 * 8);
+    }
+
+    #[cfg(feature = "bitpacking")]
+    #[rstest::rstest]
+    #[case::small_header(false)]
+    #[case::large_header(true)]
+    fn direct_bitpacking_matches_generic_across_chunks(#[case] has_large_chunk: bool) {
+        #[derive(Debug)]
+        struct GenericBitpacking(InlineBitpacking);
+        impl MiniBlockDecompressor for GenericBitpacking {
+            fn decompress(
+                &self,
+                data: Vec<LanceBuffer>,
+                num_values: u64,
+            ) -> crate::Result<DataBlock> {
+                MiniBlockDecompressor::decompress(&self.0, data, num_values)
+            }
+        }
+
+        let make_chunk = |values: &[u32]| {
+            let mut padded = vec![0_u32; 1024];
+            padded[..values.len()].copy_from_slice(values);
+            let mut packed = vec![12_u32; 1 + 384];
+            // SAFETY: `padded` holds 1024 values and `packed[1..]` exactly the 384 words that
+            // 1024 12-bit values take.
+            unsafe { <u32 as BitPacking>::unchecked_pack(12, &padded, &mut packed[1..]) };
+            let payload = bytemuck::cast_slice::<u32, u8>(&packed);
+            let mut chunk = vec![0_u8; 2];
+            if has_large_chunk {
+                chunk.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            } else {
+                chunk.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            }
+            let padding =
+                lance_core::utils::bit::pad_bytes::<{ super::MINIBLOCK_ALIGNMENT }>(chunk.len());
+            chunk.resize(chunk.len() + padding, 0);
+            chunk.extend_from_slice(payload);
+            LanceBuffer::from(chunk)
+        };
+        let first = make_chunk(&(0..1024).collect::<Vec<u32>>());
+        let second = make_chunk(&[7]);
+        let instruction = |chunk_idx, data: LanceBuffer, items_in_chunk, start, count| {
+            (
+                ChunkDrainInstructions {
+                    chunk_instructions: ChunkInstructions {
+                        chunk_idx,
+                        preamble: PreambleAction::Absent,
+                        rows_to_skip: 0,
+                        rows_to_take: items_in_chunk,
+                        take_trailer: false,
+                    },
+                    rows_to_skip: start,
+                    rows_to_take: count,
+                    preamble_action: PreambleAction::Absent,
+                },
+                LoadedChunk {
+                    byte_range: 0..data.len() as u64,
+                    data,
+                    items_in_chunk,
+                    chunk_idx,
+                },
+            )
+        };
+        let make_task = |decompressor: Arc<dyn MiniBlockDecompressor>| DecodeMiniBlockTask {
+            structural_projection: None,
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: decompressor,
+            dictionary_data: None,
+            def_meaning: Arc::from([]),
+            num_buffers: 1,
+            max_visible_level: 0,
+            instructions: vec![
+                instruction(0, first.clone(), 1024, 0, 1024),
+                instruction(0, first.clone(), 1024, 10, 10),
+                instruction(0, first.clone(), 1024, 15, 10),
+                instruction(1, second.clone(), 1, 0, 1),
+            ],
+            has_large_chunk,
+        };
+        let direct = Box::new(make_task(Arc::new(InlineBitpacking::new(32))))
+            .decode()
+            .unwrap();
+        let generic = Box::new(make_task(Arc::new(GenericBitpacking(
+            InlineBitpacking::new(32),
+        ))))
+        .decode()
+        .unwrap();
+        let direct = direct.data.as_fixed_width_ref().unwrap();
+        let generic = generic.data.as_fixed_width_ref().unwrap();
+        assert_eq!(direct.data, generic.data);
+        let expected = (0..1024)
+            .chain(10..20)
+            .chain(15..25)
+            .chain(std::iter::once(7))
+            .collect::<Vec<u32>>();
+        assert_eq!(direct.data.borrow_to_typed_view::<u32>().as_ref(), expected);
+
+        let mut malformed = make_task(Arc::new(InlineBitpacking::new(32)));
+        malformed.instructions[0].1.data = LanceBuffer::from(vec![0, 0, 1]);
+        let error = Box::new(malformed).decode().err().unwrap();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("header needs"));
+
+        let mut oversized = make_task(Arc::new(InlineBitpacking::new(32)));
+        oversized.instructions[0].0.rows_to_take = u64::MAX;
+        let error = Box::new(oversized).decode().err().unwrap();
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("selected value count overflow"));
     }
 
     #[test]
@@ -2275,6 +2910,48 @@ mod tests {
     }
 
     #[test]
+    fn test_schedule_stops_after_preamble_that_ends_the_row() {
+        // Chunk 0 starts one row that bleeds into chunk 1 (ends=0, partial=1).
+        // Chunk 1 is entirely a preamble and the row ends there (ends=1, partial=0).
+        // Chunk 2 starts the next row (no preamble).
+        //
+        // If the requested range covers only that first row, the scheduler must stop
+        // after chunk 1.  It used to keep `need_preamble` set for an all-preamble
+        // chunk that has no trailer, then emitted a zero-row `Absent` instruction for
+        // chunk 2.  `map_range` rejects an empty row range unless it is taking a
+        // preamble, so that instruction panicked during decoding.
+        let rep_data: Vec<u64> = vec![
+            0, 1, // chunk 0: no rows end, trailer -> the row bleeds into chunk 1
+            1, 0, // chunk 1: one row ends, no trailer -> all preamble, row ends here
+            1, 0, // chunk 2: the next row starts
+        ];
+        let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let chunk_index = MiniBlockChunkIndex::new_nested_for_test(&rep_bytes, 2);
+
+        let instructions = ChunkInstructions::schedule_instructions(&chunk_index, &[0..1]);
+
+        assert_eq!(
+            instructions,
+            vec![
+                ChunkInstructions {
+                    chunk_idx: 0,
+                    preamble: PreambleAction::Absent,
+                    rows_to_skip: 0,
+                    rows_to_take: 1,
+                    take_trailer: true,
+                },
+                ChunkInstructions {
+                    chunk_idx: 1,
+                    preamble: PreambleAction::Take,
+                    rows_to_skip: 0,
+                    rows_to_take: 0,
+                    take_trailer: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn test_drain_instructions() {
         fn drain_from_instructions(
             instructions: &mut VecDeque<ChunkInstructions>,
@@ -2612,28 +3289,34 @@ mod tests {
     #[test]
     fn test_deep_size_per_variant_below_legacy() {
         // The previous representation cached 48 bytes per chunk (24 for ChunkMeta plus
-        // 24 for a rep-index block); every variant's heap must be well below that.
+        // 24 for a rep-index block), plus two inline Vec headers.
         const LEGACY_PER_CHUNK: usize = 48;
+        const LEGACY_FIXED_SIZE: usize = 2 * std::mem::size_of::<Vec<[u64; 3]>>();
         let num_chunks = 3;
-        let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
+        let legacy_size = LEGACY_FIXED_SIZE + LEGACY_PER_CHUNK * num_chunks;
+        let size = |index: &MiniBlockChunkIndex| index.deep_size_of();
 
         let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
         let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
-        assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
+        assert!(size(&uniform) < legacy_size);
 
         let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
         let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0).unwrap();
         assert_eq!(flat.row_mapping_debug(), "flat");
-        assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
+        assert!(size(&flat) < legacy_size);
         // Flat carries a value-starts array that UniformFlat derives arithmetically.
-        assert!(heap(&flat) > heap(&uniform));
+        assert!(size(&flat) > size(&uniform));
 
         let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
         let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
         let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1).unwrap();
         assert_eq!(nested.row_mapping_debug(), "nested");
-        assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
+        let nested_size = size(&nested);
+        assert!(
+            nested_size < legacy_size,
+            "nested index uses {nested_size} bytes, legacy uses {legacy_size}"
+        );
     }
 
     #[test]
@@ -2710,6 +3393,65 @@ mod tests {
         let dictionary = scheduler.dictionary.unwrap();
         assert_eq!(dictionary.num_dictionary_items, 1);
         assert_eq!(dictionary.dictionary_data_alignment, 1);
+    }
+
+    #[rstest]
+    #[case::utf8(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 4, false)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 8, true)]
+    fn test_miniblock_variable_dictionary_offsets_aligned(
+        #[case] values: ArrayRef,
+        #[case] offset_alignment: usize,
+        #[case] copied: bool,
+    ) {
+        let (payload, dictionary_encoding) = VariableEncoder::default()
+            .compress(DataBlock::from_array(values))
+            .unwrap();
+        let payload = payload.unwrap();
+        let layout = metadata::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(EncodingUtils::flat(64, None)),
+            dictionary: Some(dictionary_encoding),
+            num_dictionary_items: 3,
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: 3,
+            has_large_chunk: false,
+        };
+        let scheduler = super::MiniBlockScheduler::try_new(
+            &[(0, 0), (0, 0), (0, 0)],
+            /*priority=*/ 0,
+            /*items_in_page=*/ 3,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+        let dictionary = scheduler.dictionary.unwrap();
+
+        // A read can return the dictionary 4 bytes past an 8-byte boundary
+        let mut padded = vec![0_u8; payload.len() + 8];
+        let start = (12 - padded.as_ptr() as usize % 8) % 8;
+        padded[start..start + payload.len()].copy_from_slice(&payload);
+        let bytes = Bytes::from(padded).slice(start..start + payload.len());
+        assert_eq!(bytes.as_ptr() as usize % 8, 4);
+        let header_len = 2 * offset_alignment;
+        let offsets_in_place = bytes.as_ptr().wrapping_add(header_len);
+
+        let decoded = dictionary
+            .dictionary_decompressor
+            .decompress(
+                Some(LanceBuffer::from_bytes(
+                    bytes,
+                    dictionary.dictionary_data_alignment,
+                )),
+                3,
+            )
+            .unwrap();
+
+        let offsets = &decoded.as_variable_width_ref().unwrap().offsets;
+        assert_eq!(offsets.as_ptr().align_offset(offset_alignment), 0);
+        assert_eq!(offsets.as_ptr() != offsets_in_place, copied);
     }
 
     #[test]
@@ -2843,6 +3585,7 @@ mod tests {
                 bytes.resize(bytes.len().div_ceil(8) * 8, 0);
             }
             let task = DecodeMiniBlockTask {
+                structural_projection: None,
                 rep_decompressor: Some(codec.clone()),
                 def_decompressor: Some(codec),
                 value_decompressor: Arc::new(ValueDecompressor::from_flat(&metadata::Flat {
@@ -2944,5 +3687,47 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("mini-block"));
         }
+    }
+
+    #[test]
+    fn test_ensure_scheduled_rows_rejects_mismatch() {
+        let instructions = vec![ChunkInstructions {
+            chunk_idx: 0,
+            preamble: PreambleAction::Absent,
+            rows_to_skip: 0,
+            rows_to_take: 1,
+            take_trailer: false,
+        }];
+
+        super::ensure_scheduled_rows(1, &instructions).expect("matching row counts must pass");
+
+        let error = super::ensure_scheduled_rows(2, &instructions)
+            .expect_err("a chunk index that maps too few rows must fail");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("maps 2 requested rows to 1 rows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_build_chunk_index_rejects_mismatched_rep_index() {
+        // Two chunks in the metadata, but a repetition index that only covers one.
+        let words = Words::from_bytes(bytes::Bytes::from(vec![1u8, 0, 0, 0]), false).unwrap();
+        let error = build_chunk_index(&words, 2, 0, 16, Some(&[0u8; 16]), 1)
+            .expect_err("a repetition index that misses a chunk must fail");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("chunks"),
+            "unexpected error: {error}"
+        );
     }
 }
